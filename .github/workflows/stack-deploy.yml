@@ -1,0 +1,126 @@
+name: Stack — Deploy via Portainer (Git repository)
+
+# Crée ou redéploie la stack sur K3s via Portainer en mode Git repository.
+# Portainer suit le repo IAC Git → pull le dernier commit + redéploie.
+#
+# Variables GitHub requis :
+#   PORTAINER_URL          ex: https://portainer.sty.ovh
+#   PORTAINER_ENDPOINT_ID  ex: 1
+#
+# Secrets GitHub requis :
+#   PORTAINER_TOKEN        clé API Portainer
+#   GH_PAT                 PAT avec Contents:read sur le repo IAC
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "stacks/app-stack.yml"
+
+env:
+  PORTAINER_URL: ${{ vars.PORTAINER_URL }}
+  ENDPOINT_ID:   ${{ vars.PORTAINER_ENDPOINT_ID }}
+  TOKEN:         ${{ secrets.PORTAINER_TOKEN }}
+  GH_PAT:        ${{ secrets.GH_PAT }}
+  STACK_NAME:    APP_NAME           # ← remplacer
+  NAMESPACE:     APP_NAME           # ← remplacer
+  IAC_REPO:      MON_ORG/MON_IAC   # ← ex: styleran/stylera-iac
+  STACK_FILE:    stacks/app-stack.yml
+
+jobs:
+  deploy:
+    name: Deploy ${{ env.STACK_NAME }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Vérifier si la stack existe
+        id: check
+        run: |
+          RESP=$(curl -s "$PORTAINER_URL/api/stacks?endpointId=$ENDPOINT_ID" \
+            -H "X-API-Key: $TOKEN")
+          STACK_ID=$(echo "$RESP" | jq -r ".[] | select(.Name==\"$STACK_NAME\") | .Id // empty")
+          echo "stack_id=$STACK_ID" >> "$GITHUB_OUTPUT"
+          [ -n "$STACK_ID" ] && echo "ℹ️ Stack existante (id=$STACK_ID)" || echo "ℹ️ Nouvelle stack"
+
+      - name: Créer la stack (première fois)
+        id: create
+        if: steps.check.outputs.stack_id == ''
+        run: |
+          PAYLOAD=$(jq -cn \
+            --arg name "$STACK_NAME" \
+            --arg repo "https://github.com/$IAC_REPO" \
+            --arg file "$STACK_FILE" \
+            --arg ns   "$NAMESPACE"  \
+            --arg pass "$GH_PAT"     \
+            '{
+              stackName: $name,
+              repositoryURL: $repo,
+              repositoryReferenceName: "refs/heads/main",
+              manifestFile: $file,
+              namespace: $ns,
+              composeFormat: false,
+              repositoryAuthentication: true,
+              repositoryUsername: "x-token",
+              repositoryPassword: $pass
+            }')
+
+          STATUS=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+            -X POST "$PORTAINER_URL/api/stacks/create/kubernetes/repository?endpointId=$ENDPOINT_ID" \
+            -H "X-API-Key: $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          echo "POST create: $STATUS"
+          [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ] && { cat /tmp/resp.json; exit 1; }
+          STACK_ID=$(jq -r '.Id // .id // empty' /tmp/resp.json)
+          echo "stack_id=$STACK_ID" >> "$GITHUB_OUTPUT"
+          echo "✅ Stack créée (id=$STACK_ID)"
+
+      - name: Redéployer depuis Git
+        if: steps.check.outputs.stack_id != ''
+        run: |
+          STACK_ID="${{ steps.check.outputs.stack_id }}"
+          PAYLOAD=$(jq -cn --arg pass "$GH_PAT" '{
+            repositoryReferenceName: "refs/heads/main",
+            repositoryAuthentication: true,
+            repositoryUsername: "x-token",
+            repositoryPassword: $pass,
+            pullImage: true
+          }')
+          STATUS=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+            -X PUT "$PORTAINER_URL/api/stacks/$STACK_ID/git/redeploy?endpointId=$ENDPOINT_ID" \
+            -H "X-API-Key: $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          echo "PUT redeploy: $STATUS"
+          [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ] && { cat /tmp/resp.json; exit 1; }
+          echo "✅ Stack redéployée depuis Git"
+
+      - name: Rollout restart des pods
+        run: |
+          BASE="$PORTAINER_URL/api/endpoints/$ENDPOINT_ID/kubernetes"
+          RESTART_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          PATCH=$(jq -cn --arg t "$RESTART_AT" \
+            '{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":$t}}}}}')
+          for DEPLOY in APP_NAME-api APP_NAME-front; do   # ← adapter les déploiements
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X PATCH "$BASE/apis/apps/v1/namespaces/$NAMESPACE/deployments/$DEPLOY" \
+              -H "X-API-Key: $TOKEN" \
+              -H "Content-Type: application/strategic-merge-patch+json" \
+              -d "$PATCH")
+            echo "Restart $DEPLOY: $STATUS"
+          done
+
+      - name: Statut des pods
+        run: |
+          sleep 30
+          BASE="$PORTAINER_URL/api/endpoints/$ENDPOINT_ID/kubernetes"
+          PODS=$(curl -s "$BASE/api/v1/namespaces/$NAMESPACE/pods" -H "X-API-Key: $TOKEN")
+          echo "### Pods $NAMESPACE" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pod | Phase | État |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-------|------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "$PODS" | jq -r '
+            .items[] |
+            (.status.containerStatuses[0].state | to_entries[0].key // "-") as $state |
+            "| \(.metadata.name) | \(.status.phase) | \($state) |"
+          ' >> "$GITHUB_STEP_SUMMARY"

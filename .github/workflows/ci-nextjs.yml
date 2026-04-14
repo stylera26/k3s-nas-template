@@ -1,0 +1,32 @@
+name: CI Next.js (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
+      api-url:
+        type: string
+        default: 'http://localhost:8080'
+
+jobs:
+  ci:
+    name: Lint + Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+        continue-on-error: true
+      - run: npx tsc --noEmit
+        continue-on-error: true
+      - run: npm audit --audit-level=high
+        continue-on-error: true
+      - run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: ${{ inputs.api-url }}

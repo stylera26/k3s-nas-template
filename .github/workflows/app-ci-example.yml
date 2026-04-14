@@ -1,0 +1,38 @@
+# Exemple de CI pour une app — copier dans le repo de l'app et adapter.
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    # Pour Kotlin : remplacer par ci-kotlin.yml
+    uses: MON_ORG/MON_CICD/.github/workflows/ci-nextjs.yml@main
+    with:
+      node-version: '22'
+      api-url: 'http://localhost:8080'
+
+  docker:
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    uses: MON_ORG/MON_CICD/.github/workflows/docker-build-push.yml@main
+    with:
+      image-name: MON_APP
+      project: MON_PROJECT
+      registry: registry.sty.ovh
+      registry-username: ${{ vars.HARBOR_USERNAME }}
+    secrets:
+      registry-password: ${{ secrets.HARBOR_PASSWORD }}
+
+  deploy:
+    needs: docker
+    if: github.ref == 'refs/heads/main'
+    uses: MON_ORG/MON_CICD/.github/workflows/deploy-portainer.yml@main
+    with:
+      stack-name: MON_APP
+    secrets:
+      webhook-url: ${{ secrets.PORTAINER_WEBHOOK_MON_APP }}

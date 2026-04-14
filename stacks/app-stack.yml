@@ -1,0 +1,397 @@
+# ─── Template stack K3s — à adapter par projet ────────────────────────────────
+# Variables à remplacer (grep APP_NAME, APP_DOMAIN, APP_REGISTRY_PROJECT) :
+#   APP_NAME            → nom du projet (ex: stylera, orion)
+#   APP_DOMAIN          → domaine de base (ex: sty.ovh)
+#   APP_REGISTRY        → registry Harbor (ex: registry.sty.ovh)
+#   APP_REGISTRY_PROJECT → projet Harbor (ex: stylera)
+#
+# Prérequis (init-stack.sh) :
+#   - namespace "APP_NAME" créé
+#   - secret "APP_NAME-secrets" créé
+#   - secret "harbor-credentials" créé
+
+# ─── MongoDB PVC ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongodb-data
+  namespace: APP_NAME
+spec:
+  storageClassName: longhorn
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# ─── MongoDB Deployment ───────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb
+  namespace: APP_NAME
+  labels:
+    app: mongodb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+        - name: mongodb
+          image: mongo:7.0
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: APP_NAME-secrets
+                  key: mongodb_root_username
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: APP_NAME-secrets
+                  key: mongodb_root_password
+            - name: MONGO_INITDB_DATABASE
+              value: APP_NAME
+          ports:
+            - containerPort: 27017
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mongodb-data
+
+---
+# ─── MongoDB Service ──────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: APP_NAME
+spec:
+  selector:
+    app: mongodb
+  ports:
+    - port: 27017
+      targetPort: 27017
+
+---
+# ─── MinIO PVC ────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: APP_NAME
+spec:
+  storageClassName: longhorn
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# ─── MinIO Deployment ─────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: APP_NAME
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: APP_NAME-secrets
+                  key: minio_access_key
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: APP_NAME-secrets
+                  key: minio_secret_key
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+              cpu: 500m
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+
+---
+# ─── MinIO Service ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: APP_NAME
+spec:
+  selector:
+    app: minio
+  ports:
+    - port: 9000
+      targetPort: 9000
+      name: api
+    - port: 9001
+      targetPort: 9001
+      name: console
+
+---
+# ─── MinIO Ingress ────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minio
+  namespace: APP_NAME
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.certresolver: myresolver
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: s3.APP_DOMAIN
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minio
+                port:
+                  number: 9000
+    - host: minio.APP_DOMAIN
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minio
+                port:
+                  number: 9001
+
+---
+# ─── Backend API Deployment ───────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: APP_NAME-api
+  namespace: APP_NAME
+  labels:
+    app: APP_NAME-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: APP_NAME-api
+  template:
+    metadata:
+      labels:
+        app: APP_NAME-api
+    spec:
+      imagePullSecrets:
+        - name: harbor-credentials
+      containers:
+        - name: APP_NAME-api
+          image: APP_REGISTRY/APP_REGISTRY_PROJECT/APP_NAME-api:latest
+          imagePullPolicy: Always
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: prod
+            - name: SERVER_PORT
+              value: "8080"
+            - name: SPRING_DATA_MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: APP_NAME-secrets
+                  key: mongodb_uri
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: APP_NAME-secrets
+                  key: jwt_secret
+            - name: S3_ENDPOINT
+              value: https://s3.APP_DOMAIN
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: APP_NAME-secrets
+                  key: minio_access_key
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: APP_NAME-secrets
+                  key: minio_secret_key
+            - name: APP_FRONTEND_URL
+              value: https://app.APP_DOMAIN
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 250m
+            limits:
+              memory: 2Gi
+              cpu: "2"
+
+---
+# ─── Backend API Service ──────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: APP_NAME-api
+  namespace: APP_NAME
+spec:
+  selector:
+    app: APP_NAME-api
+  ports:
+    - port: 80
+      targetPort: 8080
+
+---
+# ─── Backend API Ingress ──────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: APP_NAME-api
+  namespace: APP_NAME
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.certresolver: myresolver
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: api.APP_DOMAIN
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: APP_NAME-api
+                port:
+                  number: 80
+
+---
+# ─── Frontend Deployment ──────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: APP_NAME-front
+  namespace: APP_NAME
+  labels:
+    app: APP_NAME-front
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: APP_NAME-front
+  template:
+    metadata:
+      labels:
+        app: APP_NAME-front
+    spec:
+      imagePullSecrets:
+        - name: harbor-credentials
+      containers:
+        - name: APP_NAME-front
+          image: APP_REGISTRY/APP_REGISTRY_PROJECT/APP_NAME-front:latest
+          imagePullPolicy: Always
+          env:
+            - name: PORT
+              value: "3000"
+            - name: NEXT_PUBLIC_API_URL
+              value: https://api.APP_DOMAIN
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+              cpu: 500m
+
+---
+# ─── Frontend Service ─────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: APP_NAME-front
+  namespace: APP_NAME
+spec:
+  selector:
+    app: APP_NAME-front
+  ports:
+    - port: 80
+      targetPort: 3000
+
+---
+# ─── Frontend Ingress ─────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: APP_NAME-front
+  namespace: APP_NAME
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.certresolver: myresolver
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: app.APP_DOMAIN
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: APP_NAME-front
+                port:
+                  number: 80

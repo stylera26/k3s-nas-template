@@ -1,0 +1,43 @@
+name: CI Kotlin (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        type: string
+        default: '21'
+      gradle-args:
+        type: string
+        default: 'build'
+      mongodb-uri:
+        type: string
+        default: 'mongodb://localhost:27017/test'
+
+jobs:
+  ci:
+    name: Build + Test
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: temurin
+          cache: gradle
+      - uses: gradle/actions/setup-gradle@v4
+      - run: chmod +x gradlew
+      - run: ./gradlew ${{ inputs.gradle-args }}
+        env:
+          SPRING_DATA_MONGODB_URI: ${{ inputs.mongodb-uri }}
+      - uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH

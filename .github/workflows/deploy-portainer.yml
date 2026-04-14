@@ -1,0 +1,29 @@
+name: Deploy via Portainer (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      stack-name:
+        description: "Nom de la stack"
+        required: true
+        type: string
+    secrets:
+      webhook-url:
+        description: "URL complète du webhook Portainer"
+        required: true
+
+jobs:
+  deploy:
+    name: Redeploy ${{ inputs.stack-name }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Portainer webhook
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${{ secrets.webhook-url }}")
+          echo "Portainer response: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "204" ]; then
+            echo "Webhook failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Stack ${{ inputs.stack-name }} redeploy triggered"
