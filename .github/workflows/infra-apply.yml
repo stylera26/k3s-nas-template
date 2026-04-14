@@ -1,0 +1,44 @@
+name: Infra — Namespace + PVCs (Terraform)
+
+# Crée ou met à jour le namespace et les PVCs Longhorn sur K3s.
+# À lancer une seule fois lors du bootstrap, puis si les tailles de PVC changent.
+#
+# Secrets requis dans ce repo :
+#   TF_KUBECONFIG_BASE64 — cat ~/.kube/config | base64 | tr -d '\n'
+
+on:
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    name: Terraform apply — APP_NAME-infra
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.TF_KUBECONFIG_BASE64 }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBECONFIG_B64" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Terraform Init
+        working-directory: terraform/APP_NAME-infra   # ← remplacer APP_NAME
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: terraform/APP_NAME-infra
+        run: terraform plan
+
+      - name: Terraform Apply
+        working-directory: terraform/APP_NAME-infra
+        run: terraform apply -auto-approve

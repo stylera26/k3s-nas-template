@@ -18,20 +18,19 @@ on:
     paths:
       - "stacks/app-stack.yml"
 
-env:
-  PORTAINER_URL: ${{ vars.PORTAINER_URL }}
-  ENDPOINT_ID:   ${{ vars.PORTAINER_ENDPOINT_ID }}
-  TOKEN:         ${{ secrets.PORTAINER_TOKEN }}
-  GH_PAT:        ${{ secrets.GH_PAT }}
-  STACK_NAME:    APP_NAME           # ← remplacer
-  NAMESPACE:     APP_NAME           # ← remplacer
-  IAC_REPO:      MON_ORG/MON_IAC   # ← ex: styleran/stylera-iac
-  STACK_FILE:    stacks/app-stack.yml
-
 jobs:
   deploy:
-    name: Deploy ${{ env.STACK_NAME }}
+    name: Deploy APP_NAME
     runs-on: ubuntu-latest
+    env:
+      PORTAINER_URL: ${{ vars.PORTAINER_URL }}
+      ENDPOINT_ID:   ${{ vars.PORTAINER_ENDPOINT_ID }}
+      TOKEN:         ${{ secrets.PORTAINER_TOKEN }}
+      GH_PAT:        ${{ secrets.GH_PAT }}
+      STACK_NAME:    APP_NAME           # ← remplacer
+      NAMESPACE:     APP_NAME           # ← remplacer
+      IAC_REPO:      MON_ORG/MON_IAC   # ← ex: styleran/stylera-iac
+      STACK_FILE:    stacks/app-stack.yml
 
     steps:
       - name: Vérifier si la stack existe
@@ -41,9 +40,13 @@ jobs:
             -H "X-API-Key: $TOKEN")
           STACK_ID=$(echo "$RESP" | jq -r ".[] | select(.Name==\"$STACK_NAME\") | .Id // empty")
           echo "stack_id=$STACK_ID" >> "$GITHUB_OUTPUT"
-          [ -n "$STACK_ID" ] && echo "ℹ️ Stack existante (id=$STACK_ID)" || echo "ℹ️ Nouvelle stack"
+          if [ -n "$STACK_ID" ]; then
+            echo "ℹ️ Stack '$STACK_NAME' existante (id=$STACK_ID) → git/redeploy"
+          else
+            echo "ℹ️ Stack '$STACK_NAME' absente → création Git repository"
+          fi
 
-      - name: Créer la stack (première fois)
+      - name: Créer la stack (Git repository)
         id: create
         if: steps.check.outputs.stack_id == ''
         run: |
@@ -52,7 +55,8 @@ jobs:
             --arg repo "https://github.com/$IAC_REPO" \
             --arg file "$STACK_FILE" \
             --arg ns   "$NAMESPACE"  \
-            --arg pass "$GH_PAT"     \
+            --arg user "x-token" \
+            --arg pass "$GH_PAT" \
             '{
               stackName: $name,
               repositoryURL: $repo,
@@ -61,40 +65,73 @@ jobs:
               namespace: $ns,
               composeFormat: false,
               repositoryAuthentication: true,
-              repositoryUsername: "x-token",
+              repositoryUsername: $user,
               repositoryPassword: $pass
             }')
 
           STATUS=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
-            -X POST "$PORTAINER_URL/api/stacks/create/kubernetes/repository?endpointId=$ENDPOINT_ID" \
+            -X POST \
+            "$PORTAINER_URL/api/stacks/create/kubernetes/repository?endpointId=$ENDPOINT_ID" \
             -H "X-API-Key: $TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
-          echo "POST create: $STATUS"
-          [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ] && { cat /tmp/resp.json; exit 1; }
-          STACK_ID=$(jq -r '.Id // .id // empty' /tmp/resp.json)
+
+          echo "POST create status: $STATUS"
+          cat /tmp/resp.json | jq '.' 2>/dev/null || cat /tmp/resp.json
+
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ]; then
+            echo "❌ Création échouée (HTTP $STATUS)"
+            exit 1
+          fi
+
+          STACK_ID=$(cat /tmp/resp.json | jq -r '.Id // .id // empty')
           echo "stack_id=$STACK_ID" >> "$GITHUB_OUTPUT"
-          echo "✅ Stack créée (id=$STACK_ID)"
+          echo "✅ Stack créée en mode Git repository (id=$STACK_ID)"
 
       - name: Redéployer depuis Git
+        id: redeploy
         if: steps.check.outputs.stack_id != ''
         run: |
           STACK_ID="${{ steps.check.outputs.stack_id }}"
-          PAYLOAD=$(jq -cn --arg pass "$GH_PAT" '{
-            repositoryReferenceName: "refs/heads/main",
-            repositoryAuthentication: true,
-            repositoryUsername: "x-token",
-            repositoryPassword: $pass,
-            pullImage: true
-          }')
+
+          PAYLOAD=$(jq -cn \
+            --arg user "x-token" \
+            --arg pass "$GH_PAT" \
+            '{
+              repositoryReferenceName: "refs/heads/main",
+              repositoryAuthentication: true,
+              repositoryUsername: $user,
+              repositoryPassword: $pass,
+              pullImage: true
+            }')
+
           STATUS=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
-            -X PUT "$PORTAINER_URL/api/stacks/$STACK_ID/git/redeploy?endpointId=$ENDPOINT_ID" \
+            -X PUT \
+            "$PORTAINER_URL/api/stacks/$STACK_ID/git/redeploy?endpointId=$ENDPOINT_ID" \
             -H "X-API-Key: $TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
-          echo "PUT redeploy: $STATUS"
-          [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ] && { cat /tmp/resp.json; exit 1; }
-          echo "✅ Stack redéployée depuis Git"
+
+          echo "PUT redeploy status: $STATUS"
+          cat /tmp/resp.json | jq '.' 2>/dev/null || cat /tmp/resp.json
+
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "201" ]; then
+            echo "❌ Redeploy échoué (HTTP $STATUS)"
+            exit 1
+          fi
+
+          echo "✅ Stack redéployée depuis Git (branch main)"
+
+      - name: Résumé
+        run: |
+          STACK_ID="${{ steps.create.outputs.stack_id || steps.check.outputs.stack_id }}"
+          echo "## ✅ Stack $STACK_NAME déployée (Git repository)" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Clé | Valeur |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stack ID  | \`$STACK_ID\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Repo      | https://github.com/$IAC_REPO |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Fichier   | \`$STACK_FILE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Namespace | \`$NAMESPACE\` |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Rollout restart des pods
         run: |
@@ -108,19 +145,50 @@ jobs:
               -H "X-API-Key: $TOKEN" \
               -H "Content-Type: application/strategic-merge-patch+json" \
               -d "$PATCH")
-            echo "Restart $DEPLOY: $STATUS"
+            echo "Restart $DEPLOY: HTTP $STATUS"
           done
 
       - name: Statut des pods
         run: |
-          sleep 30
+          sleep 45
           BASE="$PORTAINER_URL/api/endpoints/$ENDPOINT_ID/kubernetes"
           PODS=$(curl -s "$BASE/api/v1/namespaces/$NAMESPACE/pods" -H "X-API-Key: $TOKEN")
-          echo "### Pods $NAMESPACE" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pod | Phase | État |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-----|-------|------|" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Pods namespace $NAMESPACE" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pod | Phase | État | Détail |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-------|------|--------|" >> "$GITHUB_STEP_SUMMARY"
           echo "$PODS" | jq -r '
             .items[] |
-            (.status.containerStatuses[0].state | to_entries[0].key // "-") as $state |
-            "| \(.metadata.name) | \(.status.phase) | \($state) |"
-          ' >> "$GITHUB_STEP_SUMMARY"
+            (.status.containerStatuses[0].state | to_entries[0] | .key // "-") as $state |
+            (.status.containerStatuses[0].state | to_entries[0].value |
+              (.reason // .message // "") | .[0:80]) as $detail |
+            "| \(.metadata.name) | \(.status.phase) | \($state) | \($detail) |"
+          ' | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # Events + logs pour les pods en erreur
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Pods en erreur" >> "$GITHUB_STEP_SUMMARY"
+          echo "$PODS" | jq -r '
+            .items[] |
+            select(
+              .status.phase != "Running" or
+              (.status.containerStatuses[0].state.terminated != null) or
+              (.status.containerStatuses[0].state.waiting != null)
+            ) | .metadata.name
+          ' | while read POD; do
+            [ -z "$POD" ] && continue
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**$POD — events**" >> "$GITHUB_STEP_SUMMARY"
+            curl -s "$BASE/api/v1/namespaces/$NAMESPACE/events?fieldSelector=involvedObject.name=$POD" \
+              -H "X-API-Key: $TOKEN" \
+              | jq -r '.items[-5:] | reverse | .[] | "- \(.reason): \(.message[0:120])"' \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**$POD — logs (50 dernières lignes)**" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            curl -s "$BASE/api/v1/namespaces/$NAMESPACE/pods/$POD/log?tailLines=50" \
+              -H "X-API-Key: $TOKEN" | tail -50 | tee -a "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          done
